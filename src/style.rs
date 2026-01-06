@@ -1,8 +1,8 @@
-use std::collections::HashMap;
 use std::fmt::{self, Formatter, Write};
 use std::mem;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
+use std::{collections::HashMap, ops::Deref};
 #[cfg(feature = "unicode-width")]
 use unicode_width::UnicodeWidthChar;
 
@@ -204,7 +204,13 @@ impl ProgressStyle {
         &self.tick_strings[self.tick_strings.len() - 1]
     }
 
-    fn format_bar(&self, fract: f32, width: usize, alt_style: Option<&Style>) -> BarDisplay<'_> {
+    fn format_bar(
+        &self,
+        fract: f32,
+        width: usize,
+        style: Option<Style>,
+        alt_style: Option<Style>,
+    ) -> BarDisplay<'_> {
         // The number of clusters from progress_chars to write (rounding down).
         let width = width / self.char_width;
         // The number of full clusters (including a fractional component for a partially-full one).
@@ -230,6 +236,14 @@ impl ProgressStyle {
             None
         };
 
+        let cur = cur.map(|idx| {
+            style
+                .unwrap_or_default()
+                .apply_to(self.progress_chars[idx].deref())
+                .size_hint(Some(width))
+                .position_hint(Some(entirely_filled))
+        });
+
         // Number of entirely empty clusters needed to fill the bar up to `width`.
         let bg = width
             .saturating_sub(entirely_filled)
@@ -239,11 +253,22 @@ impl ProgressStyle {
             num: bg,
         };
 
+        let filled = RepeatedStringDisplay {
+            str: &self.progress_chars[0],
+            num: entirely_filled,
+        };
+
         BarDisplay {
-            chars: &self.progress_chars,
-            filled: entirely_filled,
+            filled: style
+                .unwrap_or_default()
+                .apply_to(filled)
+                .size_hint(Some(width)),
+            rest: alt_style
+                .unwrap_or_default()
+                .apply_to(rest)
+                .size_hint(Some(width))
+                .position_hint(Some(entirely_filled + if cur.is_some() { 1 } else { 0 })),
             cur,
-            rest: alt_style.unwrap_or(&Style::new()).apply_to(rest),
         }
     }
 
@@ -269,13 +294,18 @@ impl ProgressStyle {
                     style,
                     alt_style,
                 } => {
+                    let mut style = *style;
+
                     buf.clear();
                     if let Some(tracker) = self.format_map.get(key.as_str()) {
                         tracker.write(state, &mut TabRewriter(&mut buf, self.tab_width));
                     } else {
                         match key.as_str() {
                             "wide_bar" => {
-                                wide = Some(WideElement::Bar { alt_style });
+                                wide = Some(WideElement::Bar {
+                                    style: style.take(),
+                                    alt_style: *alt_style,
+                                });
                                 buf.push('\x00');
                             }
                             "bar" => buf
@@ -284,7 +314,8 @@ impl ProgressStyle {
                                     self.format_bar(
                                         state.fraction(),
                                         width.unwrap_or(20) as usize,
-                                        alt_style.as_ref(),
+                                        style.take(),
+                                        *alt_style,
                                     )
                                 ))
                                 .unwrap(),
@@ -386,6 +417,7 @@ impl ProgressStyle {
                                 align: *align,
                                 truncate: *truncate,
                             };
+
                             match style {
                                 Some(s) => cur
                                     .write_fmt(format_args!("{}", s.apply_to(padded)))
@@ -452,15 +484,20 @@ impl Write for TabRewriter<'_> {
 
 #[derive(Clone, Copy)]
 enum WideElement<'a> {
-    Bar { alt_style: &'a Option<Style> },
-    Message { align: &'a Alignment },
+    Bar {
+        style: Option<Style>,
+        alt_style: Option<Style>,
+    },
+    Message {
+        align: &'a Alignment,
+    },
 }
 
 impl WideElement<'_> {
     fn expand(
         self,
         cur: String,
-        style: &ProgressStyle,
+        progress_style: &ProgressStyle,
         state: &ProgressState,
         buf: &mut String,
         width: u16,
@@ -471,11 +508,11 @@ impl WideElement<'_> {
                 None => measure_text_width(&cur),
             });
         match self {
-            Self::Bar { alt_style } => cur.replace(
+            Self::Bar { style, alt_style } => cur.replace(
                 '\x00',
                 &format!(
                     "{}",
-                    style.format_bar(state.fraction(), left, alt_style.as_ref())
+                    progress_style.format_bar(state.fraction(), left, style, alt_style)
                 ),
             ),
             WideElement::Message { align } => {
@@ -696,25 +733,26 @@ enum State {
     AltStyle,
 }
 
+#[derive(Debug)]
 struct BarDisplay<'a> {
-    chars: &'a [Box<str>],
-    filled: usize,
-    cur: Option<usize>,
+    filled: console::StyledObject<RepeatedStringDisplay<'a>>,
+    cur: Option<console::StyledObject<&'a str>>,
     rest: console::StyledObject<RepeatedStringDisplay<'a>>,
 }
 
 impl fmt::Display for BarDisplay<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for _ in 0..self.filled {
-            f.write_str(&self.chars[0])?;
+        self.filled.fmt(f)?;
+
+        if let Some(cur) = self.cur.as_ref() {
+            cur.fmt(f)?;
         }
-        if let Some(cur) = self.cur {
-            f.write_str(&self.chars[cur])?;
-        }
+
         self.rest.fmt(f)
     }
 }
 
+#[derive(Debug)]
 struct RepeatedStringDisplay<'a> {
     str: &'a str,
     num: usize,
@@ -729,6 +767,7 @@ impl fmt::Display for RepeatedStringDisplay<'_> {
     }
 }
 
+#[derive(Debug)]
 struct PaddedStringDisplay<'a> {
     str: &'a str,
     width: usize,
@@ -1102,7 +1141,7 @@ mod tests {
         style.format_state(&state, &mut buf, WIDTH);
         assert_eq!(
             &buf[0],
-            "\u{1b}[31m\u{1b}[44m====\u{1b}[32m\u{1b}[46m----\u{1b}[0m\u{1b}[0m"
+            "\u{1b}[31m\u{1b}[44m====\u{1b}[0m\u{1b}[32m\u{1b}[46m----\u{1b}[0m"
         );
     }
 
@@ -1131,7 +1170,7 @@ mod tests {
         style.format_state(&state, &mut buf, WIDTH);
         assert_eq!(
             &buf[0],
-            "\u{1b}[31m\u{1b}[44m====>\u{1b}[32m\u{1b}[46m---\u{1b}[0m\u{1b}[0m"
+            "\u{1b}[31m\u{1b}[44m====\u{1b}[0m\u{1b}[31m\u{1b}[44m>\u{1b}[0m\u{1b}[32m\u{1b}[46m---\u{1b}[0m"
         );
 
         buf.clear();
